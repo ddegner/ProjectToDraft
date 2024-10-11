@@ -1,0 +1,155 @@
+-- Utility function to remove quoted text from an email body
+on removeQuotedText(emailBody)
+    set cleanedBody to ""
+    set skipMode to false
+    repeat with eachLine in paragraphs of emailBody
+        if (eachLine starts with "On " and eachLine contains " wrote:") or (eachLine starts with "-----Original Message-----") then
+            set skipMode to true
+        else if skipMode and eachLine is equal to "" then
+            set skipMode to false
+        else if not skipMode and eachLine does not start with ">" then
+            set cleanedBody to cleanedBody & eachLine & return
+        end if
+    end repeat
+    return cleanedBody
+end removeQuotedText
+
+on execute()
+    -- Retrieve the API key from Keychain
+    try
+        set openAIAPIKey to (do shell script "security find-generic-password -w -s OpenAI_API_Key")
+    on error
+        display dialog "API key not found in Keychain. Please add it and try again." buttons {"OK"} default button "OK"
+        return
+    end try
+
+    tell application "Mail"
+        -- Get the selected messages
+        set selectedMessages to selection
+        if selectedMessages is {} then
+            display dialog "No email selected. Please select an email thread." buttons {"OK"} default button "OK"
+            return
+        end if
+        
+        -- Initialize variables
+        set threadContent to ""
+        
+        repeat with eachMessage in selectedMessages
+            -- Get email details
+            set emailSender to sender of eachMessage
+            set emailSubject to subject of eachMessage
+            set emailDate to date received of eachMessage
+            set emailBody to my removeQuotedText(content of eachMessage)
+            
+            -- Append email details to threadContent
+            set threadContent to threadContent & "From: " & emailSender & return & "Subject: " & emailSubject & return & "Date: " & emailDate & return & emailBody & return & "---" & return & return
+        end repeat
+    end tell
+
+    -- Combine the prompt and the thread content
+    set promptText to "I am David Degner, the photographer, and this is an email thread with my client. Please extract the following information from the email thread for me. Focus on the most relevant and clear information for each section, using explicit details mentioned in the emails. Format the response as beautiful plaintext with clear spacing between sections, and avoid using any Markdown formatting. Ensure all key information is captured and displayed clearly.
+
+Here is the format to follow:
+
+- The first line should be the project title, written directly without a heading.
+- Subsequent sections should include a heading.
+
+CLIENT INFORMATION:
+Include the client or company requesting the work, with their main contact and role if available and relevant contact details such as email or phone numbers. Do not label each piece of information.
+
+AGENCY:
+Mention any agency or intermediary company involved, if applicable, including their name and relevant contact information.
+
+PROJECT TIMELINE:
+Extract relevant dates, including deadlines, shoot dates, or delivery timelines.
+
+LOCATION:
+Mention any location where the photography will take place or that is associated with the client or agency.
+
+PROJECT DESCRIPTION:
+Summarize the key objectives and scope of the project. Include any style, goals, or focus areas mentioned.
+
+ART DIRECTION / STYLISTIC PREFERENCES:
+Highlight any references to stylistic direction, art direction, or creative requirements.
+
+DELIVERABLES:
+List the required outputs, such as final images, edited photos, reports, or videos. Include quantity, format, and deadlines.
+
+BUDGET, COSTS, AND ESTIMATES:
+Extract all mentions of costs, estimates, or budgets. Look for terms such as 'budget', 'cost', 'estimate', 'fee', 'pricing', 'cost breakdown', 'quote', 'rate', or any mention of monetary values (e.g., '$500', 'USD', 'total cost'). Ensure every detail about finances is captured, even if mentioned indirectly.
+
+TEAM AND ROLES:
+Identify any other team members mentioned (e.g., assistants, models, makeup artists) and their roles.
+
+LICENSING AND USAGE RIGHTS:
+Include any mentions of licensing terms, usage rights, or agreements on how the photos will be used.
+
+REVISIONS OR FEEDBACK:
+Extract any details regarding rounds of revisions, feedback processes, or client approval steps.
+
+SPECIAL REQUIREMENTS:
+Mention any additional or unique requirements related to the shoot (e.g., equipment, props, permits, travel arrangements).
+
+EXTRA NOTES:
+Capture any additional information, such as meeting schedules, important discussions, or extra tasks.
+
+Make sure the project title appears as the first line without a label, and the remaining sections follow with clear headings and spacing."
+    set fullPrompt to promptText & return & return & "Email Thread Content:" & return & threadContent
+
+    -- Save the full prompt to a temporary file
+    set promptFilePath to POSIX path of (path to temporary items from user domain) & "full_prompt.txt"
+    try
+        do shell script "echo " & quoted form of fullPrompt & " > " & quoted form of promptFilePath
+    on error errMsg
+        display dialog "Failed to write prompt file: " & errMsg buttons {"OK"} default button "OK"
+        return
+    end try
+
+    -- Use Python3 to construct the JSON payload and make the API request
+    try
+        set apiResponse to do shell script "/usr/bin/python3 <<END
+import json
+import urllib.request
+
+api_key = \"" & openAIAPIKey & "\"
+
+with open('" & promptFilePath & "', 'r', encoding='utf-8') as f:
+    prompt = f.read()
+
+messages = [
+    {\"role\": \"user\", \"content\": prompt}
+]
+
+payload = {
+    \"model\": \"gpt-4o\",
+    \"messages\": messages
+}
+
+headers = {
+    \"Content-Type\": \"application/json\",
+    \"Authorization\": f\"Bearer {api_key}\"
+}
+
+req = urllib.request.Request(\"https://api.openai.com/v1/chat/completions\", data=json.dumps(payload).encode('utf-8'), headers=headers)
+with urllib.request.urlopen(req) as response:
+    result = json.loads(response.read())
+    print(result['choices'][0]['message']['content'])
+END"
+    on error errMsg
+        display dialog "Failed to get response from OpenAI API: " & errMsg buttons {"OK"} default button "OK"
+        return
+    end try
+
+    set jsonResult to apiResponse
+
+    -- Create a new draft in Drafts app with the extracted information
+    tell application "Drafts"
+        set fullContent to jsonResult & return & return & "------------------" & return & threadContent
+        make new draft with properties {content: fullContent, flagged: false, tags: {"commercial job"}}
+    end tell
+
+    -- Clean up the temporary files
+    do shell script "rm " & quoted form of promptFilePath
+end execute
+
+end
