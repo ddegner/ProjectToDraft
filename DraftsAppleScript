@@ -1,48 +1,157 @@
--- Utility function to remove quoted text from an email body
+-- Email Thread Processor for Drafts
+-- This AppleScript runs as an action in the Drafts app it processes selected email threads from Mail,
+-- pulls out the imporant information using OpenAI's GPT-4o, creates a new draft in the Drafts app with the
+-- extracted information and original thread content, and includes links to each original message in the Mail app.
+-- It runs on a modern MacOS with Python3.
+
+-- Improved function to remove quoted text from an email body
 on removeQuotedText(emailBody)
     set cleanedBody to ""
     set skipMode to false
+    set quoteHeaderPattern to "On .* at .*, .* wrote:"
+
     repeat with eachLine in paragraphs of emailBody
-        if (eachLine starts with "On " and eachLine contains " wrote:") or (eachLine starts with "-----Original Message-----") then
+        set trimmedLine to my trim(eachLine)
+
+        if trimmedLine starts with ">" then
+            -- Skip lines starting with ">"
             set skipMode to true
-        else if skipMode and eachLine is equal to "" then
+        else if my matchesPattern(trimmedLine, quoteHeaderPattern) then
+            -- Skip lines matching the quote header pattern
+            set skipMode to true
+        else if trimmedLine starts with "On " and trimmedLine contains " wrote:" then
+            -- Skip lines starting with "On" and containing "wrote:"
+            set skipMode to true
+        else if trimmedLine starts with "-----Original Message-----" then
+            -- Skip lines indicating the start of an original message
+            set skipMode to true
+        else if skipMode and trimmedLine is equal to "" then
+            -- Reset skip mode on empty lines
             set skipMode to false
-        else if not skipMode and eachLine does not start with ">" then
-            set cleanedBody to cleanedBody & eachLine & return
+        else if not skipMode then
+            -- Add non-quoted lines to the cleaned body
+            set cleanedBody to cleanedBody & eachLine & linefeed
         end if
     end repeat
-    return cleanedBody
+
+    return my trim(cleanedBody)
 end removeQuotedText
 
-on execute()
-    -- Retrieve the API key from Keychain
-    try
-        set openAIAPIKey to (do shell script "security find-generic-password -w -s OpenAI_API_Key")
-    on error
-        display dialog "API key not found in Keychain. Please add it and try again." buttons {"OK"} default button "OK"
-        return
-    end try
+-- Function to replace characters in a string
+on replace_chars(theText, searchString, replacementString)
+    set AppleScript's text item delimiters to searchString
+    set theItems to text items of theText
+    set AppleScript's text item delimiters to replacementString
+    set theText to theItems as string
+    set AppleScript's text item delimiters to ""
+    return theText
+end replace_chars
 
+-- Helper function to trim whitespace from the beginning and end of a string
+on trim(someText)
+    -- Remove leading and trailing whitespace
+    repeat while someText begins with " "
+        set someText to text 2 thru -1 of someText
+    end repeat
+    repeat while someText ends with " "
+        set someText to text 1 thru -2 of someText
+    end repeat
+    return someText
+end trim
+
+-- Helper function to match a string against a pattern
+on matchesPattern(someText, pattern)
+    try
+        do shell script "echo " & quoted form of someText & " | grep -E " & quoted form of pattern & " > /dev/null"
+        return true
+    on error
+        return false
+    end try
+end matchesPattern
+
+-- Quicksort handler for sorting email messages by date
+on quick_sort(myList)
+    if (count of myList) ≤ 1 then
+        return myList
+    else
+        set {thePivot, theRest} to {item 1 of myList, rest of myList}
+        set thePivotValue to dateReceived of thePivot
+        set theLeft to {}
+        set theRight to {}
+        repeat with anItem in theRest
+            if dateReceived of anItem ≤ thePivotValue then
+                set end of theLeft to anItem
+            else
+                set end of theRight to anItem
+            end if
+        end repeat
+        return quick_sort(theLeft) & {thePivot} & quick_sort(theRight)
+    end if
+end quick_sort
+
+
+-- Helper function to URL-encode a string
+on urlEncode(inputString)
+    set allowedChars to "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~"
+    set encodedString to ""
+    repeat with char in inputString
+        if allowedChars contains char then
+            set encodedString to encodedString & char
+        else
+            set asciiNum to ASCII number char
+            set hexString to do shell script "printf '%02X' " & asciiNum
+            set encodedString to encodedString & "%" & hexString
+        end if
+    end repeat
+    return encodedString
+end urlEncode
+
+-- Function to create a message link for a given message
+on createMessageLink(theMessage)
+    set messageID to id of theMessage as string
+    set quotedMessageID to my urlEncode(messageID)
+    return "message://%3C" & quotedMessageID & "%3E"
+end createMessageLink
+
+on execute()
     tell application "Mail"
-        -- Get the selected messages
+        -- Get the selected messages from Mail
         set selectedMessages to selection
         if selectedMessages is {} then
             display dialog "No email selected. Please select an email thread." buttons {"OK"} default button "OK"
             return
         end if
-        
-        -- Initialize variables
-        set threadContent to ""
-        
+
+        -- Create a list of records {messageObject, dateReceived} for sorting
+        set messageList to {}
         repeat with eachMessage in selectedMessages
+            set end of messageList to {messageObject:eachMessage, dateReceived:date received of eachMessage}
+        end repeat
+
+        -- Sort the messageList based on dateReceived
+        set sortedMessageList to my quick_sort(messageList)
+
+        -- Initialize variables for thread content
+        set threadContent to ""
+
+        -- Process the messages in sorted order
+        repeat with messageRecord in sortedMessageList
+            set eachMessage to messageObject of messageRecord
             -- Get email details
             set emailSender to sender of eachMessage
             set emailSubject to subject of eachMessage
             set emailDate to date received of eachMessage
-            set emailBody to my removeQuotedText(content of eachMessage)
-            
+            set emailBody to content of eachMessage
+
+            -- Remove quoted text
+            set cleanedBody to my removeQuotedText(emailBody)
+
+            -- Create and add the message link after removing quoted text
+            set messageLink to my createMessageLink(eachMessage)
+            set cleanedBody to cleanedBody & "Message Link: " & messageLink & linefeed
+
             -- Append email details to threadContent
-            set threadContent to threadContent & "From: " & emailSender & return & "Subject: " & emailSubject & return & "Date: " & emailDate & return & emailBody & return & "---" & return & return
+            set threadContent to threadContent & "From: " & emailSender & " / Subject: " & emailSubject & " / Date: " & emailDate & linefeed & cleanedBody & linefeed & "---" & linefeed & linefeed
         end repeat
     end tell
 
@@ -53,6 +162,7 @@ Here is the format to follow:
 
 - The first line should be the project title, written directly without a heading.
 - Subsequent sections should include a heading.
+- If there is no information for a section only write the heading and leave the section blank.
 
 CLIENT INFORMATION:
 Include the client or company requesting the work, with their main contact and role if available and relevant contact details such as email or phone numbers. Do not label each piece of information.
@@ -64,18 +174,18 @@ PROJECT TIMELINE:
 Extract relevant dates, including deadlines, shoot dates, or delivery timelines.
 
 LOCATION:
-Mention any location where the photography will take place or that is associated with the client or agency.
+Where exactly will the photography take place or what is the address of the client.
 
 PROJECT DESCRIPTION:
 Summarize the key objectives and scope of the project. Include any style, goals, or focus areas mentioned.
 
-ART DIRECTION / STYLISTIC PREFERENCES:
+ART DIRECTION:
 Highlight any references to stylistic direction, art direction, or creative requirements.
 
 DELIVERABLES:
 List the required outputs, such as final images, edited photos, reports, or videos. Include quantity, format, and deadlines.
 
-BUDGET, COSTS, AND ESTIMATES:
+BUDGET:
 Extract all mentions of costs, estimates, or budgets. Look for terms such as 'budget', 'cost', 'estimate', 'fee', 'pricing', 'cost breakdown', 'quote', 'rate', or any mention of monetary values (e.g., '$500', 'USD', 'total cost'). Ensure every detail about finances is captured, even if mentioned indirectly.
 
 TEAM AND ROLES:
@@ -94,26 +204,42 @@ EXTRA NOTES:
 Capture any additional information, such as meeting schedules, important discussions, or extra tasks.
 
 Make sure the project title appears as the first line without a label, and the remaining sections follow with clear headings and spacing."
-    set fullPrompt to promptText & return & return & "Email Thread Content:" & return & threadContent
+
+    set fullPrompt to promptText & linefeed & linefeed & "Email Thread Content:" & linefeed & threadContent
 
     -- Save the full prompt to a temporary file
-    set promptFilePath to POSIX path of (path to temporary items from user domain) & "full_prompt.txt"
+    set promptFilePath to (path to temporary items from user domain as text) & "email_processor_prompt.txt"
     try
-        do shell script "echo " & quoted form of fullPrompt & " > " & quoted form of promptFilePath
+        set promptFile to open for access file promptFilePath with write permission
+        set eof of promptFile to 0
+        write fullPrompt to promptFile as «class utf8»
+        close access promptFile
     on error errMsg
+        try
+            close access file promptFilePath
+        end try
         display dialog "Failed to write prompt file: " & errMsg buttons {"OK"} default button "OK"
         return
     end try
 
-    -- Use Python3 to construct the JSON payload and make the API request
+    -- Retrieve the OpenAI API key from Keychain
+    try
+        set openAIAPIKey to (do shell script "security find-generic-password -w -s OpenAI_API_Key")
+    on error
+        display dialog "API key not found in Keychain. Please add it and try again." buttons {"OK"} default button "OK"
+        return
+    end try
+
+    -- Use Python3 to construct the JSON payload and make the API request to OpenAI
     try
         set apiResponse to do shell script "/usr/bin/python3 <<END
 import json
 import urllib.request
+import base64
 
 api_key = \"" & openAIAPIKey & "\"
 
-with open('" & promptFilePath & "', 'r', encoding='utf-8') as f:
+with open('" & POSIX path of promptFilePath & "', 'r', encoding='utf-8') as f:
     prompt = f.read()
 
 messages = [
@@ -133,23 +259,24 @@ headers = {
 req = urllib.request.Request(\"https://api.openai.com/v1/chat/completions\", data=json.dumps(payload).encode('utf-8'), headers=headers)
 with urllib.request.urlopen(req) as response:
     result = json.loads(response.read())
-    print(result['choices'][0]['message']['content'])
+    print(base64.b64encode(result['choices'][0]['message']['content'].encode('utf-8')).decode('utf-8'))
 END"
     on error errMsg
         display dialog "Failed to get response from OpenAI API: " & errMsg buttons {"OK"} default button "OK"
         return
     end try
 
-    set jsonResult to apiResponse
+    -- Decode the base64 encoded response from OpenAI
+    set jsonResult to do shell script "echo " & apiResponse & " | base64 --decode"
+    set jsonResult to replace_chars(jsonResult, return, linefeed)
 
-    -- Create a new draft in Drafts app with the extracted information
+    -- Create a new draft in Drafts app with the extracted information and original thread content
     tell application "Drafts"
-        set fullContent to jsonResult & return & return & "------------------" & return & threadContent
-        make new draft with properties {content: fullContent, flagged: false, tags: {"commercial job"}}
+        set fullContent to jsonResult & linefeed & linefeed & "------------------" & linefeed & threadContent
+        make new draft with properties {content:fullContent, flagged:false, tags:{"commercial job"}}
     end tell
 
-    -- Clean up the temporary files
-    do shell script "rm " & quoted form of promptFilePath
 end execute
 
-end
+-- Run the execute function when the script is run
+execute()
