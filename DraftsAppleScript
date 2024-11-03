@@ -2,39 +2,21 @@
 -- This AppleScript runs as an action in the Drafts app it processes selected email threads from Mail,
 -- pulls out the imporant information using OpenAI's GPT-4o, creates a new draft in the Drafts app with the
 -- extracted information and original thread content, and includes links to each original message in the Mail app.
--- It runs on a modern MacOS with Python3.
+-- It runs on a modern MacOS with a bit of Python3.
 
--- Improved function to remove quoted text from an email body
+use framework "Foundation"
+use scripting additions
+
+-- Function to remove quoted text from an email body
 on removeQuotedText(emailBody)
-    set cleanedBody to ""
-    set skipMode to false
-    set quoteHeaderPattern to "On .* at .*, .* wrote:"
-
-    repeat with eachLine in paragraphs of emailBody
-        set trimmedLine to my trim(eachLine)
-
-        if trimmedLine starts with ">" then
-            -- Skip lines starting with ">"
-            set skipMode to true
-        else if my matchesPattern(trimmedLine, quoteHeaderPattern) then
-            -- Skip lines matching the quote header pattern
-            set skipMode to true
-        else if trimmedLine starts with "On " and trimmedLine contains " wrote:" then
-            -- Skip lines starting with "On" and containing "wrote:"
-            set skipMode to true
-        else if trimmedLine starts with "-----Original Message-----" then
-            -- Skip lines indicating the start of an original message
-            set skipMode to true
-        else if skipMode and trimmedLine is equal to "" then
-            -- Reset skip mode on empty lines
-            set skipMode to false
-        else if not skipMode then
-            -- Add non-quoted lines to the cleaned body
-            set cleanedBody to cleanedBody & eachLine & linefeed
-        end if
+    set nsEmailBody to current application's NSString's stringWithString:emailBody
+    -- Regular expression patterns to match quoted text
+    set patterns to {"(?m)^(>.*)$", "(?s)^On .*? wrote:.*", "(?m)^-----Original Message-----.*", "(?m)^From:.*", "(?m)^Sent:.*", "(?m)^To:.*", "(?m)^Subject:.*"}
+    repeat with pattern in patterns
+        set regex to current application's NSRegularExpression's regularExpressionWithPattern:pattern options:0 |error|:(missing value)
+        set nsEmailBody to regex's stringByReplacingMatchesInString:nsEmailBody options:0 range:{0, nsEmailBody's |length|()} withTemplate:""
     end repeat
-
-    return my trim(cleanedBody)
+    return nsEmailBody as string
 end removeQuotedText
 
 -- Function to replace characters in a string
@@ -47,122 +29,170 @@ on replace_chars(theText, searchString, replacementString)
     return theText
 end replace_chars
 
--- Helper function to trim whitespace from the beginning and end of a string
+-- Helper function to trim whitespace from a string
 on trim(someText)
-    -- Remove leading and trailing whitespace
-    repeat while someText begins with " "
-        set someText to text 2 thru -1 of someText
-    end repeat
-    repeat while someText ends with " "
-        set someText to text 1 thru -2 of someText
-    end repeat
-    return someText
+    set nsText to current application's NSString's stringWithString:someText
+    set trimmedText to nsText's stringByTrimmingCharactersInSet:(current application's NSCharacterSet's whitespaceAndNewlineCharacterSet())
+    return trimmedText as string
 end trim
-
--- Helper function to match a string against a pattern
-on matchesPattern(someText, pattern)
-    try
-        do shell script "echo " & quoted form of someText & " | grep -E " & quoted form of pattern & " > /dev/null"
-        return true
-    on error
-        return false
-    end try
-end matchesPattern
-
--- Quicksort handler for sorting email messages by date
-on quick_sort(myList)
-    if (count of myList) ≤ 1 then
-        return myList
-    else
-        set {thePivot, theRest} to {item 1 of myList, rest of myList}
-        set thePivotValue to dateReceived of thePivot
-        set theLeft to {}
-        set theRight to {}
-        repeat with anItem in theRest
-            if dateReceived of anItem ≤ thePivotValue then
-                set end of theLeft to anItem
-            else
-                set end of theRight to anItem
-            end if
-        end repeat
-        return quick_sort(theLeft) & {thePivot} & quick_sort(theRight)
-    end if
-end quick_sort
-
 
 -- Helper function to URL-encode a string
 on urlEncode(inputString)
-    set allowedChars to "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~"
-    set encodedString to ""
-    repeat with char in inputString
-        if allowedChars contains char then
-            set encodedString to encodedString & char
-        else
-            set asciiNum to ASCII number char
-            set hexString to do shell script "printf '%02X' " & asciiNum
-            set encodedString to encodedString & "%" & hexString
-        end if
-    end repeat
-    return encodedString
+    set nsString to current application's NSString's stringWithString:inputString
+    set allowedChars to current application's NSCharacterSet's URLQueryAllowedCharacterSet()
+    set encodedString to nsString's stringByAddingPercentEncodingWithAllowedCharacters:allowedChars
+    return encodedString as string
 end urlEncode
 
 -- Function to create a message link for a given message
 on createMessageLink(theMessage)
-    set messageID to id of theMessage as string
-    set quotedMessageID to my urlEncode(messageID)
-    return "message://%3C" & quotedMessageID & "%3E"
+    tell application "Mail"
+        set messageId to message id of theMessage
+        set messageSubject to subject of theMessage
+    end tell
+    set messageLink to "message://%3c" & messageId & "%3e"
+    set markdownLink to "[" & messageSubject & "](" & messageLink & ")"
+    return markdownLink
 end createMessageLink
 
-on execute()
+-- Function to write text to a file using ASObjC
+on writeToFile(theText, theFilePath)
+    try
+        set theNSString to current application's NSString's stringWithString:theText
+        set theNSData to theNSString's dataUsingEncoding:(current application's NSUTF8StringEncoding)
+        theNSData's writeToFile:theFilePath atomically:true
+        return true
+    on error errMsg
+        display alert "Failed to write to file: " & errMsg
+        return false
+    end try
+end writeToFile
+
+-- Function to retrieve API key from Keychain
+on getAPIKeyFromKeychain(keyName)
+    try
+        set apiKey to do shell script "security find-generic-password -w -s " & quoted form of keyName
+        return apiKey
+    on error
+        return missing value
+    end try
+end getAPIKeyFromKeychain
+
+-- Function to sort messages by date using a custom sort
+on sortMessagesByDate(messageList)
+    set sortedMessages to messageList
+    set messageCount to count of sortedMessages
     tell application "Mail"
-        -- Get the selected messages from Mail
-        set selectedMessages to selection
-        if selectedMessages is {} then
-            display dialog "No email selected. Please select an email thread." buttons {"OK"} default button "OK"
-            return
-        end if
-
-        -- Create a list of records {messageObject, dateReceived} for sorting
-        set messageList to {}
-        repeat with eachMessage in selectedMessages
-            set end of messageList to {messageObject:eachMessage, dateReceived:date received of eachMessage}
-        end repeat
-
-        -- Sort the messageList based on dateReceived
-        set sortedMessageList to my quick_sort(messageList)
-
-        -- Initialize variables for thread content
-        set threadContent to ""
-
-        -- Process the messages in sorted order
-        repeat with messageRecord in sortedMessageList
-            set eachMessage to messageObject of messageRecord
-            -- Get email details
-            set emailSender to sender of eachMessage
-            set emailSubject to subject of eachMessage
-            set emailDate to date received of eachMessage
-            set emailBody to content of eachMessage
-
-            -- Remove quoted text
-            set cleanedBody to my removeQuotedText(emailBody)
-
-            -- Create and add the message link after removing quoted text
-            set messageLink to my createMessageLink(eachMessage)
-            set cleanedBody to cleanedBody & "Message Link: " & messageLink & linefeed
-
-            -- Append email details to threadContent
-            set threadContent to threadContent & "From: " & emailSender & " / Subject: " & emailSubject & " / Date: " & emailDate & linefeed & cleanedBody & linefeed & "---" & linefeed & linefeed
+        repeat with i from 1 to (messageCount - 1)
+            repeat with j from (i + 1) to messageCount
+                set messageI to item i of sortedMessages
+                set messageJ to item j of sortedMessages
+                set dateI to date received of messageI
+                set dateJ to date received of messageJ
+                if dateI > dateJ then
+                    -- Swap the messages
+                    set item i of sortedMessages to messageJ
+                    set item j of sortedMessages to messageI
+                end if
+            end repeat
         end repeat
     end tell
+    return sortedMessages
+end sortMessagesByDate
 
-    -- Combine the prompt and the thread content
-    set promptText to "I am David Degner, the photographer, and this is an email thread with my client. Please extract the following information from the email thread for me. Focus on the most relevant and clear information for each section, using explicit details mentioned in the emails. Format the response as beautiful plaintext with clear spacing between sections, and avoid using any Markdown formatting. Ensure all key information is captured and displayed clearly.
+-- Function to call OpenAI API using Python
+on callOpenAIAPI(apiKey, promptFilePath)
+    set pythonScript to "
+import json
+import urllib.request
+import urllib.error
+import sys
+
+api_key = '" & apiKey & "'
+
+with open('" & promptFilePath & "', 'r', encoding='utf-8') as f:
+    prompt = f.read()
+
+messages = [
+    {\"role\": \"user\", \"content\": prompt}
+]
+
+payload = {
+    \"model\": \"gpt-4o\",
+    \"messages\": messages
+}
+
+headers = {
+    \"Content-Type\": \"application/json\",
+    \"Authorization\": f\"Bearer {api_key}\"
+}
+
+req = urllib.request.Request(\"https://api.openai.com/v1/chat/completions\", data=json.dumps(payload).encode('utf-8'), headers=headers)
+
+try:
+    with urllib.request.urlopen(req) as response:
+        result = json.loads(response.read())
+        print(result['choices'][0]['message']['content'])
+except urllib.error.HTTPError as e:
+    error_info = e.read().decode('utf-8')
+    print(f\"API request failed: {error_info}\")
+    sys.exit(1)
+"
+    try
+        set apiResponse to do shell script "/usr/bin/python3 -c " & quoted form of pythonScript
+        return apiResponse
+    on error errMsg
+        return errMsg
+    end try
+end callOpenAIAPI
+
+-- Function to execute the main script
+on execute()
+    try
+        tell application "Mail"
+            -- Get the selected messages from Mail
+            set selectedMessages to selection
+            if selectedMessages is {} then
+                display alert "No email selected" message "Please select an email thread." buttons {"OK"} default button "OK"
+                return
+            end if
+
+            -- Sort the messages by date received
+            set sortedMessages to my sortMessagesByDate(selectedMessages)
+
+            -- Initialize variables for thread content
+            set threadContent to ""
+
+            -- Process the messages in sorted order
+            repeat with eachMessage in sortedMessages
+                -- Get email details
+                set emailSender to sender of eachMessage
+                set emailSubject to subject of eachMessage
+                set emailDate to date received of eachMessage
+                set emailBody to content of eachMessage
+
+                -- Remove quoted text
+                set cleanedBody to my removeQuotedText(emailBody)
+
+                -- Create and add the message link
+                set messageLink to my createMessageLink(eachMessage)
+
+                -- Append email details to threadContent
+                set threadContent to threadContent & "From: " & emailSender & " / Subject: " & emailSubject & " / Date: " & emailDate & linefeed & cleanedBody & linefeed & "Message Link: " & messageLink & linefeed & "---" & linefeed & linefeed
+            end repeat
+        end tell
+
+        -- Combine the prompt and the thread content
+        set promptText to "I am David Degner, the photographer, and this is an email thread with my client. Please extract the following information from the email thread for me. Focus on the most relevant and clear information for each section, using explicit details mentioned in the emails.
+
+Ensure that all detailed information is included and is accurate.
 
 Here is the format to follow:
 
+- Format in markdown
 - The first line should be the project title, written directly without a heading.
 - Subsequent sections should include a heading.
-- If there is no information for a section only write the heading and leave the section blank.
+- If a section has no relevant information only write the heading and leave the section blank.
 
 CLIENT INFORMATION:
 Include the client or company requesting the work, with their main contact and role if available and relevant contact details such as email or phone numbers. Do not label each piece of information.
@@ -205,78 +235,38 @@ Capture any additional information, such as meeting schedules, important discuss
 
 Make sure the project title appears as the first line without a label, and the remaining sections follow with clear headings and spacing."
 
-    set fullPrompt to promptText & linefeed & linefeed & "Email Thread Content:" & linefeed & threadContent
+        set fullPrompt to promptText & linefeed & linefeed & "Email Thread Content:" & linefeed & threadContent
 
-    -- Save the full prompt to a temporary file
-    set promptFilePath to (path to temporary items from user domain as text) & "email_processor_prompt.txt"
-    try
-        set promptFile to open for access file promptFilePath with write permission
-        set eof of promptFile to 0
-        write fullPrompt to promptFile as «class utf8»
-        close access promptFile
-    on error errMsg
-        try
-            close access file promptFilePath
-        end try
-        display dialog "Failed to write prompt file: " & errMsg buttons {"OK"} default button "OK"
-        return
+        -- Generate a unique temporary file path
+        set promptFilePath to do shell script "mktemp /tmp/email_processor_prompt.XXXXXX"
+
+        -- Write the full prompt to the temporary file using the updated writeToFile function
+        my writeToFile(fullPrompt, promptFilePath)
+
+        -- Retrieve the OpenAI API key from Keychain
+        set openAIAPIKey to my getAPIKeyFromKeychain("OpenAI_API_Key")
+        if openAIAPIKey is missing value then
+            display alert "API Key Not Found" message "Please store your OpenAI API Key in the Keychain." buttons {"OK"} default button "OK"
+            return
+        end if
+
+        -- Use Python3 to make the API request
+        set apiResponse to my callOpenAIAPI(openAIAPIKey, promptFilePath)
+        if apiResponse starts with "API request failed:" then
+            display alert "API Error" message apiResponse buttons {"OK"} default button "OK"
+            return
+        end if
+
+        -- Create a new draft in Drafts app with the extracted information and original thread content
+        tell application "Drafts"
+            set fullContent to my replace_chars(apiResponse, return, linefeed) & linefeed & linefeed & "------------------" & linefeed & my replace_chars(threadContent, "return", linefeed)
+            make new draft with properties {content:fullContent, flagged:false, tags:{"1 commercial"}}
+        end tell
+
+    on error errMsg number errNum
+        display alert "An error occurred: " & errMsg & " (Error " & errNum & ")"
     end try
-
-    -- Retrieve the OpenAI API key from Keychain
-    try
-        set openAIAPIKey to (do shell script "security find-generic-password -w -s OpenAI_API_Key")
-    on error
-        display dialog "API key not found in Keychain. Please add it and try again." buttons {"OK"} default button "OK"
-        return
-    end try
-
-    -- Use Python3 to construct the JSON payload and make the API request to OpenAI
-    try
-        set apiResponse to do shell script "/usr/bin/python3 <<END
-import json
-import urllib.request
-import base64
-
-api_key = \"" & openAIAPIKey & "\"
-
-with open('" & POSIX path of promptFilePath & "', 'r', encoding='utf-8') as f:
-    prompt = f.read()
-
-messages = [
-    {\"role\": \"user\", \"content\": prompt}
-]
-
-payload = {
-    \"model\": \"gpt-4o\",
-    \"messages\": messages
-}
-
-headers = {
-    \"Content-Type\": \"application/json\",
-    \"Authorization\": f\"Bearer {api_key}\"
-}
-
-req = urllib.request.Request(\"https://api.openai.com/v1/chat/completions\", data=json.dumps(payload).encode('utf-8'), headers=headers)
-with urllib.request.urlopen(req) as response:
-    result = json.loads(response.read())
-    print(base64.b64encode(result['choices'][0]['message']['content'].encode('utf-8')).decode('utf-8'))
-END"
-    on error errMsg
-        display dialog "Failed to get response from OpenAI API: " & errMsg buttons {"OK"} default button "OK"
-        return
-    end try
-
-    -- Decode the base64 encoded response from OpenAI
-    set jsonResult to do shell script "echo " & apiResponse & " | base64 --decode"
-    set jsonResult to replace_chars(jsonResult, return, linefeed)
-
-    -- Create a new draft in Drafts app with the extracted information and original thread content
-    tell application "Drafts"
-        set fullContent to jsonResult & linefeed & linefeed & "------------------" & linefeed & threadContent
-        make new draft with properties {content:fullContent, flagged:false, tags:{"commercial job"}}
-    end tell
-
 end execute
 
--- Run the execute function when the script is run
+-- Run the execute function
 execute()
